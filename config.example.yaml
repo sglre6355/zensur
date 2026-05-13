@@ -1,0 +1,63 @@
+# zensur example config. Copy to config.yaml (or set ZENSUR_CONFIG=/path/to.yaml)
+# and customize. Patterns shown here are placeholders.
+
+# Global default normalization options. Each rule inherits these and can
+# override any field individually. Built-in fallbacks (when both global and
+# rule leave a field unset) are: case_insensitive=true, normalize_unicode=true,
+# strip_marks=true, leet=false, collapse_repeats=false, fold_kana=false.
+defaults:
+  case_insensitive: true
+  normalize_unicode: true   # NFKC (ｂａｄｗｏｒｄ → badword)
+  strip_marks: true         # defeats zalgo and combining-mark evasion
+  leet: false               # 0→o, 1→i, 3→e, 4→a, 5→s, 7→t, @→a, $→s, !→i
+  collapse_repeats: false   # "fuuuck" → "fuck" (only collapses runs of 3+)
+  fold_kana: false          # hiragana ↔ katakana
+
+# Used by the "warn" action and as the fallback when a rule's own notice is
+# empty. Set notice_auto_delete_seconds to 0 to leave the notice in place.
+notice: "Your message was removed."
+notice_auto_delete_seconds: 8
+
+# Used by the "replace" action when a rule's own replacement is empty.
+replacement: "***"
+
+# Rules are evaluated in order. Each rule has:
+#   id          — unique identifier (used in logs and to look up notices)
+#   patterns    — list of patterns; semantics depend on `mode`
+#   mode        — substring | word | regex
+#                   substring: matches anywhere (best for CJK / no whitespace)
+#                   word:      matches only at letter/digit boundaries
+#                              (best for English-like languages)
+#                   regex:     RE2; matched against the normalized text
+#   action      — log | delete | warn | replace
+#                   replace requires the bot to have Manage Webhooks
+#                   permission in the channel; falls back to a notice on error
+#   notice      — per-rule override of the global notice (warn / replace
+#                 fallback)
+#   replacement — per-rule override of the global replacement (replace action)
+#   allow       — phrases that suppress this rule when present in the
+#                 normalized message (Scunthorpe-problem workaround)
+# Plus any normalize option from `defaults` to override per-rule.
+rules:
+  - id: example-en
+    patterns: ["dummyword"]
+    mode: word
+    action: delete
+
+  - id: example-jp
+    patterns: ["ダミー語"]
+    mode: substring
+    action: warn
+    fold_kana: true        # match ダミー語 / だみー語
+
+  - id: example-regex
+    patterns: ['(?i)https?://(suspicious|phish)\.example\.com\S*']
+    mode: regex
+    action: replace
+    replacement: "[link removed]"
+
+  - id: example-allow
+    patterns: ["cunt"]
+    mode: substring
+    action: delete
+    allow: ["scunthorpe"]   # exempts the message when "scunthorpe" is present

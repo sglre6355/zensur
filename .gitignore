@@ -1,0 +1,12 @@
+# direnv
+.direnv/
+
+# Local config (operator-supplied, may contain wordlists you don't want
+# committed). config.example.yaml is the tracked template.
+/config.yaml
+/zensur
+
+# Go build artifacts
+/dist/
+*.test
+*.out
