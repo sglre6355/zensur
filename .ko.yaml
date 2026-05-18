@@ -1,0 +1,5 @@
+builds:
+  - id: zensur
+    main: ./cmd/zensur
+    ldflags:
+      - -X main.version={{ .Env.VERSION }}
