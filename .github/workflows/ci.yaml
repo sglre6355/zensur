@@ -1,0 +1,77 @@
+name: CI
+on:
+  pull_request:
+    branches:
+      - main
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  paths-filter:
+    name: Paths Filter
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            go:
+              - "**.go"
+              - "go.mod"
+              - "go.sum"
+              - ".golangci.yaml"
+  lint:
+    name: Lint
+    needs: paths-filter
+    if: needs.paths-filter.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - name: Run `golangci-lint`
+        uses: golangci/golangci-lint-action@v9
+        with:
+          only-new-issues: true
+  test:
+    name: Test
+    needs: paths-filter
+    if: needs.paths-filter.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - name: Run tests
+        run: go test -v -race ./...
+  build-check:
+    name: Build Check
+    needs: paths-filter
+    if: needs.paths-filter.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - name: Build
+        run: go build -v ./cmd/zensur
+  status-check:
+    name: Status Check
+    needs: [lint, test, build-check]
+    if: always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - run: exit 1
