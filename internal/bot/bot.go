@@ -57,12 +57,17 @@ func (b *Bot) Start() error {
 	b.removeHandlers = append(b.removeHandlers,
 		s.AddHandler(b.onMessageCreate),
 		s.AddHandler(b.onMessageUpdate),
+		s.AddHandler(b.onInteractionCreate),
 	)
 
 	if err := s.Open(); err != nil {
 		return fmt.Errorf("open discord session: %w", err)
 	}
 	slog.Info("discord session opened")
+
+	if err := b.registerCommands(s); err != nil {
+		return fmt.Errorf("register commands: %w", err)
+	}
 	return nil
 }
 

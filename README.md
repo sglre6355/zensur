@@ -46,10 +46,21 @@ YAML config: see [`config.example.yaml`](config.example.yaml).
 In the [Discord Developer Portal](https://discord.com/developers/applications):
 
 1. Enable **Message Content Intent** (privileged) for the bot application.
-2. Invite the bot with at minimum the **View Channels**, **Read Message
-   History**, **Manage Messages**, and **Send Messages** scopes.
+2. Invite the bot with both the `bot` and `applications.commands` scopes, and
+   at minimum the **View Channels**, **Read Message History**, **Manage
+   Messages**, and **Send Messages** permissions.
 3. For the `replace` action, also grant **Manage Webhooks** on any channel
    where you want messages re-posted under the user's identity.
+
+## Commands
+
+| Command       | Description                                              |
+|---------------|----------------------------------------------------------|
+| `/purge count`| Bulk-delete the last `count` (1–100) messages in the channel. The reply is *ephemeral* (visible only to the invoker). |
+
+`/purge` requires the **Manage Messages** permission and is hidden from members
+without it. Messages older than 14 days are deleted one at a time, since
+Discord's bulk-delete endpoint rejects them.
 
 ## Run
 
