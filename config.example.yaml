@@ -61,3 +61,53 @@ rules:
     mode: substring
     action: delete
     allow: ["scunthorpe"]   # exempts the message when "scunthorpe" is present
+
+# Optional semantic filter. Each message is also judged by a large language
+# model against the natural-language `directive` below. A message is acted on
+# if EITHER the pattern rules above OR the model flag it; when both fire, the
+# more disruptive action wins (log < warn < delete).
+#
+# Each provider is its official Go SDK wrapped behind one small in-house adapter,
+# so switching vendors is just a provider/model change here — no code changes.
+llm:
+  enabled: false                 # set true to turn the filter on
+  provider: openai               # openai | anthropic | google
+                                 #   "openai" also drives any OpenAI-compatible
+                                 #   endpoint (xAI, Groq, OpenRouter, vLLM,
+                                 #   ollama's /v1, …) when `endpoint` is set.
+  model: gpt-4o-mini             # provider-specific model id (must support vision if images.enabled)
+  api_key_env: OPENAI_API_KEY    # env var holding the API key (kept out of this file)
+  # endpoint: ""                 # optional base URL override (self-hosted gateway, Gemini base, …)
+
+  action: warn                   # log | delete | warn  (replace is not available for the LLM filter)
+  notice: "Your message was removed by the moderation assistant."
+
+  # Tuning (all optional):
+  # timeout_seconds: 15          # per-call timeout
+  # max_tokens: 200              # cap on the model's reply length
+  # temperature: 0               # 0 = deterministic
+  # max_message_chars: 4000      # truncate long messages before sending, to bound token use
+
+  # The moderation policy, in plain language. Be specific about what to flag
+  # and what to leave alone — the model applies only what you write here.
+  directive: |
+    Flag a message only if it clearly does one of the following:
+      - targets a person or group with hateful slurs or harassment
+      - shares sexually explicit content involving minors
+      - solicits or facilitates real-world violence
+      - posts scam, phishing, or malware links
+    Do NOT flag ordinary profanity, heated debate, jokes, or off-topic chatter.
+    When in doubt, do not flag.
+
+  # Optional: also inspect IMAGE ATTACHMENTS with the provider's vision model.
+  # Reuses the provider/endpoint/API key above. Each image is one extra model
+  # call, so mind cost and latency on busy channels.
+  images:
+    enabled: false               # set true to turn image filtering on
+    # model: gpt-4o              # optional vision-capable model override (defaults to the model above)
+    # action: delete             # optional override (defaults to the action above)
+    # max_bytes: 5242880         # skip image attachments larger than this (default 5 MiB)
+    # max_count: 4               # max image attachments checked per message (default 4)
+    # directive: |               # optional image-specific policy (defaults to the text directive above)
+    #   Flag the image if it depicts explicit sexual content, gore, or hateful
+    #   symbols. Do not flag ordinary photos, memes, or screenshots.

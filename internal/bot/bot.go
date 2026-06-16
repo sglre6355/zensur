@@ -1,8 +1,12 @@
 package bot
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,6 +14,10 @@ import (
 
 	"github.com/sglre6355/zensur/internal/censor"
 )
+
+// attachmentDownloadTimeout bounds how long the bot waits when fetching an
+// image attachment for LLM inspection.
+const attachmentDownloadTimeout = 20 * time.Second
 
 // webhookName is the marker used to find / create the bot's channel webhook
 // for the "replace" action. Re-using a single named webhook avoids creating a
@@ -19,9 +27,11 @@ const webhookName = "zensur"
 // Bot is a Discord client that censors messages according to a compiled
 // ruleset.
 type Bot struct {
-	cfg     *Config
-	ruleset *censor.Ruleset
-	session *discordgo.Session
+	cfg        *Config
+	ruleset    *censor.Ruleset
+	llm        *censor.LLMFilter // optional semantic filter; nil when disabled
+	session    *discordgo.Session
+	httpClient *http.Client // fetches image attachments for the LLM filter
 
 	webhookMu      sync.Mutex
 	webhooks       map[string]*discordgo.Webhook // channelID → webhook
@@ -40,6 +50,7 @@ func NewBot(cfg *Config) *Bot {
 		webhooks:    make(map[string]*discordgo.Webhook),
 		guildMeta:   make(map[string]guildMeta),
 		channelMeta: make(map[string]channelMeta),
+		httpClient:  &http.Client{Timeout: attachmentDownloadTimeout},
 	}
 }
 
@@ -52,6 +63,17 @@ func (b *Bot) Start() error {
 	}
 	b.ruleset = rs
 	slog.Info("ruleset compiled", "rules", len(rs.Rules))
+
+	if lc := b.cfg.Censor.LLM; lc != nil && lc.Enabled {
+		f, err := censor.NewLLMFilter(lc)
+		if err != nil {
+			return fmt.Errorf("init llm filter: %w", err)
+		}
+		b.llm = f
+		slog.Info("llm filter enabled",
+			"provider", f.Provider(), "model", f.Model(), "action", f.Action().String(),
+			"images", f.ImagesEnabled())
+	}
 
 	s, err := discordgo.New("Bot " + b.cfg.Token)
 	if err != nil {
@@ -110,18 +132,58 @@ func (b *Bot) onMessageUpdate(s *discordgo.Session, e *discordgo.MessageUpdate) 
 }
 
 func (b *Bot) process(s *discordgo.Session, msg *discordgo.Message) {
-	if msg == nil || msg.Content == "" {
+	if msg == nil {
 		return
 	}
-	hits := b.ruleset.Match(msg.Content)
-	if len(hits) == 0 {
+	images := b.filterableImages(msg)
+	if msg.Content == "" && len(images) == 0 {
 		return
 	}
 
+	var hits []censor.Hit
+	if msg.Content != "" {
+		hits = b.ruleset.Match(msg.Content)
+	}
+
+	// Start from the most disruptive pattern-rule action (ActionLog when no
+	// rule matched) and escalate if the semantic filter also flags the message.
+	flagged := len(hits) > 0
 	action := censor.MaxAction(hits)
+
+	llmFlagged := false
+	var llmReason string
+	if b.llm != nil && msg.Content != "" {
+		verdict, err := b.llm.Evaluate(context.Background(), msg.Content)
+		switch {
+		case err != nil:
+			slog.Error("llm filter failed",
+				"channel_id", msg.ChannelID, "message_id", msg.ID, "error", err)
+		case verdict.Flagged:
+			flagged = true
+			llmFlagged = true
+			llmReason = verdict.Reason
+			action = censor.MoreSevere(action, b.llm.Action())
+		}
+	}
+
+	if reason, ok := b.evaluateImages(msg, images); ok {
+		flagged = true
+		llmFlagged = true
+		if llmReason == "" {
+			llmReason = reason
+		}
+		action = censor.MoreSevere(action, b.llm.ImageAction())
+	}
+
+	if !flagged {
+		return
+	}
+
 	slog.Info("censor hit",
 		"action", action.String(),
 		"rules", uniqueRuleIDs(hits),
+		"llm", llmFlagged,
+		"llm_reason", llmReason,
 		"user_id", msg.Author.ID,
 		"guild_id", msg.GuildID,
 		"channel_id", msg.ChannelID,
@@ -135,16 +197,141 @@ func (b *Bot) process(s *discordgo.Session, msg *discordgo.Message) {
 		b.deleteMessage(s, msg)
 	case censor.ActionWarn:
 		b.deleteMessage(s, msg)
-		b.sendNotice(s, msg, hits)
+		b.sendNotice(s, msg, hits, llmFlagged)
 	case censor.ActionReplace:
+		// Replace only ever comes from a pattern rule (the LLM action is limited
+		// to log/delete/warn), so hits are guaranteed non-empty here.
 		censored := b.ruleset.Censor(msg.Content, hits)
 		b.deleteMessage(s, msg)
 		if err := b.repostViaWebhook(s, msg, censored); err != nil {
 			slog.Error("webhook repost failed; falling back to notice",
 				"channel_id", msg.ChannelID, "error", err)
-			b.sendNotice(s, msg, hits)
+			b.sendNotice(s, msg, hits, llmFlagged)
 		}
 	}
+}
+
+// filterableImages selects the image attachments eligible for LLM inspection:
+// content-type image/*, within the size limit, capped at the configured count.
+// Returns nil when image filtering is disabled.
+func (b *Bot) filterableImages(msg *discordgo.Message) []*discordgo.MessageAttachment {
+	if b.llm == nil || !b.llm.ImagesEnabled() || len(msg.Attachments) == 0 {
+		return nil
+	}
+	maxBytes := b.llm.ImageMaxBytes()
+	limit := b.llm.ImageMaxCount()
+	var out []*discordgo.MessageAttachment
+	for _, att := range msg.Attachments {
+		if att == nil || !isImageAttachment(att) {
+			continue
+		}
+		if maxBytes > 0 && att.Size > 0 && int64(att.Size) > maxBytes {
+			slog.Debug("skipping oversize image attachment",
+				"channel_id", msg.ChannelID, "message_id", msg.ID,
+				"filename", att.Filename, "size", att.Size, "max_bytes", maxBytes)
+			continue
+		}
+		out = append(out, att)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+// evaluateImages downloads and checks each candidate image, stopping at the
+// first one the model flags. It returns the flag reason and true on a hit. A
+// nil llm or empty list yields ("", false).
+func (b *Bot) evaluateImages(msg *discordgo.Message, images []*discordgo.MessageAttachment) (string, bool) {
+	if b.llm == nil || len(images) == 0 {
+		return "", false
+	}
+	for _, att := range images {
+		data, mime, err := b.downloadAttachment(att)
+		if err != nil {
+			slog.Error("image download failed",
+				"channel_id", msg.ChannelID, "message_id", msg.ID,
+				"filename", att.Filename, "error", err)
+			continue
+		}
+		verdict, err := b.llm.EvaluateImage(context.Background(), mime, data, msg.Content)
+		if err != nil {
+			slog.Error("llm image filter failed",
+				"channel_id", msg.ChannelID, "message_id", msg.ID,
+				"filename", att.Filename, "error", err)
+			continue
+		}
+		if verdict.Flagged {
+			return verdict.Reason, true
+		}
+	}
+	return "", false
+}
+
+// downloadAttachment fetches an attachment's bytes (bounded by the size limit)
+// and resolves its MIME type, preferring the content-type Discord reports and
+// falling back to the HTTP response header.
+func (b *Bot) downloadAttachment(att *discordgo.MessageAttachment) ([]byte, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), attachmentDownloadTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, att.URL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, "", fmt.Errorf("download status %d", resp.StatusCode)
+	}
+
+	// Cap the read at the configured size limit (+1 to detect overflow).
+	limit := b.llm.ImageMaxBytes()
+	reader := io.Reader(resp.Body)
+	if limit > 0 {
+		reader = io.LimitReader(resp.Body, limit+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, "", err
+	}
+	if limit > 0 && int64(len(data)) > limit {
+		return nil, "", fmt.Errorf("image exceeds %d bytes", limit)
+	}
+
+	mime := att.ContentType
+	if mime == "" {
+		mime = resp.Header.Get("Content-Type")
+	}
+	if i := strings.IndexByte(mime, ';'); i >= 0 { // strip "; charset=..."
+		mime = mime[:i]
+	}
+	mime = strings.TrimSpace(mime)
+	if mime == "" {
+		return nil, "", fmt.Errorf("missing content type for %s", att.Filename)
+	}
+	return data, mime, nil
+}
+
+// isImageAttachment reports whether an attachment is an image, by its reported
+// content type or, failing that, a common image file extension.
+func isImageAttachment(att *discordgo.MessageAttachment) bool {
+	if strings.HasPrefix(strings.ToLower(att.ContentType), "image/") {
+		return true
+	}
+	if att.ContentType != "" {
+		return false
+	}
+	name := strings.ToLower(att.Filename)
+	for _, ext := range []string{".png", ".jpg", ".jpeg", ".gif", ".webp"} {
+		if strings.HasSuffix(name, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Bot) deleteMessage(s *discordgo.Session, msg *discordgo.Message) {
@@ -154,8 +341,8 @@ func (b *Bot) deleteMessage(s *discordgo.Session, msg *discordgo.Message) {
 	}
 }
 
-func (b *Bot) sendNotice(s *discordgo.Session, msg *discordgo.Message, hits []censor.Hit) {
-	notice := b.noticeText(hits)
+func (b *Bot) sendNotice(s *discordgo.Session, msg *discordgo.Message, hits []censor.Hit, llmFlagged bool) {
+	notice := b.noticeText(hits, llmFlagged)
 	if notice == "" {
 		return
 	}
@@ -170,11 +357,16 @@ func (b *Bot) sendNotice(s *discordgo.Session, msg *discordgo.Message, hits []ce
 	}
 }
 
-func (b *Bot) noticeText(hits []censor.Hit) string {
+func (b *Bot) noticeText(hits []censor.Hit, llmFlagged bool) string {
+	// Prefer a matching rule's own notice, then the LLM filter's notice (when it
+	// was the trigger), then the global notice, then a built-in default.
 	for _, h := range hits {
 		if r := b.ruleset.RuleByID(h.RuleID); r != nil && r.Notice != "" {
 			return r.Notice
 		}
+	}
+	if llmFlagged && b.llm != nil && b.llm.Notice() != "" {
+		return b.llm.Notice()
 	}
 	if b.ruleset.Notice != "" {
 		return b.ruleset.Notice

@@ -398,27 +398,35 @@ func mergeHits(hits []Hit) []Hit {
 	return out
 }
 
+// actionRank orders actions by disruptiveness: log < warn < delete < replace.
+func actionRank(a Action) int {
+	switch a {
+	case ActionLog:
+		return 0
+	case ActionWarn:
+		return 1
+	case ActionDelete:
+		return 2
+	case ActionReplace:
+		return 3
+	}
+	return 0
+}
+
+// MoreSevere returns whichever of a or b is the more disruptive action.
+func MoreSevere(a, b Action) Action {
+	if actionRank(b) > actionRank(a) {
+		return b
+	}
+	return a
+}
+
 // MaxAction returns the most disruptive action among hits, in order
 // log < warn < delete < replace.
 func MaxAction(hits []Hit) Action {
 	max := ActionLog
-	rank := func(a Action) int {
-		switch a {
-		case ActionLog:
-			return 0
-		case ActionWarn:
-			return 1
-		case ActionDelete:
-			return 2
-		case ActionReplace:
-			return 3
-		}
-		return 0
-	}
 	for _, h := range hits {
-		if rank(h.Action) > rank(max) {
-			max = h.Action
-		}
+		max = MoreSevere(max, h.Action)
 	}
 	return max
 }

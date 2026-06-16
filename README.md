@@ -36,6 +36,64 @@ Three match modes:
 Plus a per-rule `allow` list of phrases that suppress the rule when present (the
 *Scunthorpe problem*).
 
+## Semantic (LLM) filter
+
+Pattern rules catch known strings; an optional **LLM filter** catches things you can only describe
+in words ("flag targeted harassment", "flag scam links"). When enabled, every message is also judged
+by a large language model against a natural-language `directive`. A message is acted on if
+**either** the pattern rules **or** the model flag it; when both fire, the more disruptive action
+wins (`log` < `warn` < `delete`).
+
+Each provider is its official Go SDK wrapped behind a small in-house adapter (the `chatProvider`
+interface), so switching vendors is just a `provider`/`model` change in the config. Supported
+providers:
+
+- `openai` ([openai-go](https://github.com/openai/openai-go)) — also drives any
+  **OpenAI-compatible** endpoint (xAI, Groq, OpenRouter, vLLM, ollama's `/v1`, …) by setting
+  `endpoint` to its base URL.
+- `anthropic` ([anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go))
+- `google` (Gemini, [google.golang.org/genai](https://pkg.go.dev/google.golang.org/genai))
+
+```yaml
+llm:
+  enabled: true
+  provider: openai
+  model: gpt-4o-mini
+  api_key_env: OPENAI_API_KEY   # the key is read from this env var, never stored in the file
+  action: warn                  # log | delete | warn  (replace is N/A — the model reports no spans)
+  directive: |
+    Flag targeted harassment, scam/phishing links, or threats of violence.
+    Do not flag ordinary profanity or jokes.
+```
+
+The API key is read from the environment variable named by `api_key_env`, so secrets stay out of the
+config file. See [`config.example.yaml`](config.example.yaml) for every option (`endpoint`,
+`timeout_seconds`, `max_tokens`, `temperature`, `max_message_chars`, `notice`).
+
+### Image attachments
+
+The same filter can inspect **image attachments** with the provider's vision model — useful for
+content that pattern rules and text analysis can't see (words baked into an image, explicit
+pictures). Enable it under `llm.images`; it reuses the provider, endpoint, and API key, and only the
+differing fields live there:
+
+```yaml
+llm:
+  # …text config above…
+  images:
+    enabled: true
+    model: gpt-4o          # optional — defaults to the text model (which must then support vision)
+    action: delete         # optional — defaults to the text action
+    max_bytes: 5242880     # skip images larger than this (default 5 MiB)
+    max_count: 4           # max images checked per message (default 4)
+    directive: |           # optional — defaults to the text directive
+      Flag the image if it depicts explicit sexual content, gore, or hateful symbols.
+```
+
+Only true image attachments (content-type `image/*`) are checked — not embeds or linked URLs. Each
+image is a separate vision call, so it adds cost and latency on busy channels. The filter (text and
+images) runs only on messages, not on guild/channel metadata.
+
 ## Configuration
 
 Env vars:
@@ -45,6 +103,7 @@ Env vars:
 | `DISCORD_TOKEN`  | yes      | —              | Bot token from Discord Developer Portal      |
 | `ZENSUR_CONFIG`  | no       | `./config.yaml`| Path to YAML config                          |
 | `LOG_LEVEL`      | no       | `info`         | `debug`, `info`, `warn`, `error`             |
+| *(LLM key)*      | if LLM   | —              | Provider API key, read from the var named by `llm.api_key_env` |
 
 YAML config: see [`config.example.yaml`](config.example.yaml).
 
@@ -84,7 +143,10 @@ DISCORD_TOKEN=... go run ./cmd/zensur
 
 The matching engine in `internal/censor` is independent of Discord. Add a new normalization stage in
 `normalize.go`, a new match `Mode` in `matcher.go`, or a new `Action` (with handling in
-`internal/bot/bot.go::process`).
+`internal/bot/bot.go::process`). The semantic filter lives in `internal/censor/llm.go` (filter
+logic, prompts, verdict parsing) and `internal/censor/llm_providers.go` (one adapter per vendor);
+adding a provider means implementing the `chatProvider` interface and registering it in
+`newProvider`.
 
 Message handling lives in `internal/bot/bot.go`; the guild/channel metadata guard lives in
 `internal/bot/metadata.go`. To guard additional metadata fields, add them to the `metaField` checks
