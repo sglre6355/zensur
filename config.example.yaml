@@ -84,8 +84,8 @@ llm:
 
   # Tuning (all optional):
   # timeout_seconds: 15          # per-call timeout
-  # max_tokens: 200              # cap on the model's reply length
-  # temperature: 0               # 0 = deterministic
+  # max_tokens: 1024             # reply cap; high because reasoning models count hidden tokens here
+  # temperature: 0               # omit to use the model default; reasoning models (GPT-5) reject custom values
   # max_message_chars: 4000      # truncate long messages before sending, to bound token use
 
   # The moderation policy, in plain language. Be specific about what to flag

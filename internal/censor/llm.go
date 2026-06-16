@@ -12,10 +12,12 @@ import (
 // Default LLMFilter tunables, applied when the corresponding config field is
 // left unset.
 const (
-	defaultLLMTimeout   = 15 * time.Second
-	defaultLLMMaxTokens = 200
+	defaultLLMTimeout = 15 * time.Second
+	// defaultLLMMaxTokens caps the model's reply. It is generous because on
+	// reasoning models (e.g. OpenAI's GPT-5 family) hidden reasoning tokens count
+	// against this budget; too low a cap starves the visible JSON verdict.
+	defaultLLMMaxTokens = 1024
 	defaultLLMMaxChars  = 4000
-	defaultLLMTemp      = 0.0
 
 	defaultImageMaxBytes int64 = 5 << 20 // 5 MiB
 	defaultImageMaxCount       = 4
@@ -72,9 +74,13 @@ type LLMFilter struct {
 	imageMaxBytes  int64
 	imageMaxCount  int
 
-	timeout     time.Duration
-	maxTokens   int
-	temperature float64
+	timeout   time.Duration
+	maxTokens int
+	// temperature is nil unless explicitly configured. It is left unset by
+	// default because some models (notably reasoning models) reject any value
+	// other than their fixed default; sending nothing lets every model accept
+	// the request.
+	temperature *float64
 }
 
 // NewLLMFilter validates cfg and constructs a ready-to-use filter. It reads the
@@ -111,10 +117,6 @@ func NewLLMFilter(cfg *LLMConfig) (*LLMFilter, error) {
 	if cfg.MaxMessageChars > 0 {
 		maxChars = cfg.MaxMessageChars
 	}
-	temperature := defaultLLMTemp
-	if cfg.Temperature != nil {
-		temperature = *cfg.Temperature
-	}
 
 	var apiKey string
 	if env := strings.TrimSpace(cfg.APIKeyEnv); env != "" {
@@ -138,7 +140,7 @@ func NewLLMFilter(cfg *LLMConfig) (*LLMFilter, error) {
 		maxChars:    maxChars,
 		timeout:     timeout,
 		maxTokens:   maxTokens,
-		temperature: temperature,
+		temperature: cfg.Temperature,
 	}
 
 	if ic := cfg.Images; ic != nil && ic.Enabled {

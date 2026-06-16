@@ -28,12 +28,14 @@ func (im chatImage) base64() string {
 // classifier instructions, text the user message/caption, and images any
 // attachments (empty for text-only calls).
 type chatRequest struct {
-	model       string
-	system      string
-	text        string
-	images      []chatImage
-	maxTokens   int
-	temperature float64
+	model     string
+	system    string
+	text      string
+	images    []chatImage
+	maxTokens int
+	// temperature is nil when unset; providers then omit it so the model uses
+	// its own default (required by reasoning models that reject custom values).
+	temperature *float64
 }
 
 // chatProvider adapts one vendor's SDK to a single complete() call that returns
@@ -96,12 +98,18 @@ func (p *openAIProvider) complete(ctx context.Context, req chatRequest) (string,
 		messages = append(messages, openai.UserMessage(parts))
 	}
 
-	resp, err := p.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model:       openai.ChatModel(req.model),
-		Messages:    messages,
-		MaxTokens:   openai.Int(int64(req.maxTokens)),
-		Temperature: openai.Float(req.temperature),
-	})
+	// GPT-5 / o-series models require max_completion_tokens (not max_tokens) and
+	// reject a non-default temperature, so temperature is sent only when set.
+	params := openai.ChatCompletionNewParams{
+		Model:               openai.ChatModel(req.model),
+		Messages:            messages,
+		MaxCompletionTokens: openai.Int(int64(req.maxTokens)),
+	}
+	if req.temperature != nil {
+		params.Temperature = openai.Float(*req.temperature)
+	}
+
+	resp, err := p.client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		return "", err
 	}
@@ -137,10 +145,12 @@ func (p *anthropicProvider) complete(ctx context.Context, req chatRequest) (stri
 	}
 
 	params := anthropic.MessageNewParams{
-		Model:       anthropic.Model(req.model),
-		MaxTokens:   int64(req.maxTokens),
-		Temperature: anthropic.Float(req.temperature),
-		Messages:    []anthropic.MessageParam{anthropic.NewUserMessage(blocks...)},
+		Model:     anthropic.Model(req.model),
+		MaxTokens: int64(req.maxTokens),
+		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(blocks...)},
+	}
+	if req.temperature != nil {
+		params.Temperature = anthropic.Float(*req.temperature)
 	}
 	if req.system != "" {
 		params.System = []anthropic.TextBlockParam{{Text: req.system}}
@@ -189,10 +199,12 @@ func (p *googleProvider) complete(ctx context.Context, req chatRequest) (string,
 	}
 	contents := []*genai.Content{{Parts: parts}}
 
-	temperature := float32(req.temperature)
 	config := &genai.GenerateContentConfig{
 		MaxOutputTokens: int32(req.maxTokens),
-		Temperature:     &temperature,
+	}
+	if req.temperature != nil {
+		temperature := float32(*req.temperature)
+		config.Temperature = &temperature
 	}
 	if req.system != "" {
 		config.SystemInstruction = &genai.Content{Parts: []*genai.Part{genai.NewPartFromText(req.system)}}
