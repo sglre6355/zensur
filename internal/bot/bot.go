@@ -26,12 +26,20 @@ type Bot struct {
 	webhookMu      sync.Mutex
 	webhooks       map[string]*discordgo.Webhook // channelID → webhook
 	removeHandlers []func()
+
+	// metaMu guards the last-known-good metadata caches used to revert
+	// rule-violating guild and channel updates.
+	metaMu      sync.RWMutex
+	guildMeta   map[string]guildMeta   // guildID → metadata
+	channelMeta map[string]channelMeta // channelID → metadata
 }
 
 func NewBot(cfg *Config) *Bot {
 	return &Bot{
-		cfg:      cfg,
-		webhooks: make(map[string]*discordgo.Webhook),
+		cfg:         cfg,
+		webhooks:    make(map[string]*discordgo.Webhook),
+		guildMeta:   make(map[string]guildMeta),
+		channelMeta: make(map[string]channelMeta),
 	}
 }
 
@@ -50,14 +58,19 @@ func (b *Bot) Start() error {
 		return fmt.Errorf("create discord session: %w", err)
 	}
 	// MessageContent is a privileged intent — it must also be enabled for the
-	// application in the Discord Developer Portal.
-	s.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentMessageContent
+	// application in the Discord Developer Portal. IntentsGuilds delivers the
+	// guild/channel create and update events the metadata guard relies on.
+	s.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages | discordgo.IntentMessageContent
 	b.session = s
 
 	b.removeHandlers = append(b.removeHandlers,
 		s.AddHandler(b.onMessageCreate),
 		s.AddHandler(b.onMessageUpdate),
 		s.AddHandler(b.onInteractionCreate),
+		s.AddHandler(b.onGuildCreate),
+		s.AddHandler(b.onChannelCreate),
+		s.AddHandler(b.onGuildUpdate),
+		s.AddHandler(b.onChannelUpdate),
 	)
 
 	if err := s.Open(); err != nil {
