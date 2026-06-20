@@ -181,6 +181,8 @@ func (b *Bot) applyMessageRules(s *discordgo.Session, msg *discordgo.Message) {
 		"image", imageFlagged,
 		"image_reason", imageReason,
 		"user_id", msg.Author.ID,
+		"username", msg.Author.Username,
+		"content", msg.Content,
 		"guild_id", msg.GuildID,
 		"channel_id", msg.ChannelID,
 		"message_id", msg.ID,
@@ -226,13 +228,16 @@ func (b *Bot) scanConversation(s *discordgo.Session, msg *discordgo.Message) {
 
 	// ChannelMessages returns newest-first; reverse to oldest-first and keep only
 	// human messages that carry text. Skipping the bot's own posts avoids
-	// flagging our notices and webhook reposts.
+	// flagging our notices and webhook reposts. byID lets us recover the original
+	// content and sender for a flagged message when logging the deletion.
 	conv := make([]censor.ConversationMessage, 0, len(fetched))
+	byID := make(map[string]*discordgo.Message, len(fetched))
 	for i := len(fetched) - 1; i >= 0; i-- {
 		m := fetched[i]
 		if m == nil || m.Author == nil || m.Author.Bot || m.Content == "" {
 			continue
 		}
+		byID[m.ID] = m
 		conv = append(conv, censor.ConversationMessage{
 			ID:      m.ID,
 			Author:  messageAuthor(m),
@@ -256,9 +261,20 @@ func (b *Bot) scanConversation(s *discordgo.Session, msg *discordgo.Message) {
 	action := b.llm.Action()
 	deleted := 0
 	for _, fm := range flagged {
+		var userID, username, content string
+		if m := byID[fm.ID]; m != nil {
+			if m.Author != nil {
+				userID = m.Author.ID
+				username = m.Author.Username
+			}
+			content = m.Content
+		}
 		slog.Info("censor hit (conversation)",
 			"action", action.String(),
 			"llm_reason", fm.Reason,
+			"user_id", userID,
+			"username", username,
+			"content", content,
 			"guild_id", msg.GuildID,
 			"channel_id", msg.ChannelID,
 			"message_id", fm.ID,
