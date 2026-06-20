@@ -21,6 +21,72 @@ const purgeMaxMessages = 100
 // message; older messages must be deleted one at a time.
 const bulkDeleteMaxAge = 14 * 24 * time.Hour
 
+// statusCommandName is the slash command that sets the bot's presence
+// (activity line and online status). Like /purge it replies ephemerally.
+const statusCommandName = "status"
+
+// statusActivityTypes maps the choice values exposed in the /status command to
+// discordgo activity types. The keys are also the choice values sent back to
+// Discord, so they must stay in sync with the Choices list below.
+var statusActivityTypes = map[string]discordgo.ActivityType{
+	"playing":   discordgo.ActivityTypeGame,
+	"watching":  discordgo.ActivityTypeWatching,
+	"listening": discordgo.ActivityTypeListening,
+	"competing": discordgo.ActivityTypeCompeting,
+	"custom":    discordgo.ActivityTypeCustom,
+}
+
+// statusPresences maps the choice values for the optional "presence" option to
+// the status strings Discord expects.
+var statusPresences = map[string]string{
+	"online":    "online",
+	"idle":      "idle",
+	"dnd":       "dnd",
+	"invisible": "invisible",
+}
+
+// statusCommand sets an arbitrary presence for the bot. It is gated to
+// administrators since it changes the bot's global, guild-independent identity.
+var statusCommand = &discordgo.ApplicationCommand{
+	Name:                     statusCommandName,
+	Description:              "Set the bot's status (presence)",
+	DefaultMemberPermissions: ptr(int64(discordgo.PermissionAdministrator)),
+	DMPermission:             ptr(false),
+	Options: []*discordgo.ApplicationCommandOption{
+		{
+			Type:        discordgo.ApplicationCommandOptionString,
+			Name:        "type",
+			Description: "Activity type",
+			Required:    true,
+			Choices: []*discordgo.ApplicationCommandOptionChoice{
+				{Name: "Playing", Value: "playing"},
+				{Name: "Watching", Value: "watching"},
+				{Name: "Listening", Value: "listening"},
+				{Name: "Competing", Value: "competing"},
+				{Name: "Custom", Value: "custom"},
+			},
+		},
+		{
+			Type:        discordgo.ApplicationCommandOptionString,
+			Name:        "text",
+			Description: "The status text",
+			Required:    true,
+		},
+		{
+			Type:        discordgo.ApplicationCommandOptionString,
+			Name:        "presence",
+			Description: "Online status (defaults to online)",
+			Required:    false,
+			Choices: []*discordgo.ApplicationCommandOptionChoice{
+				{Name: "Online", Value: "online"},
+				{Name: "Idle", Value: "idle"},
+				{Name: "Do Not Disturb", Value: "dnd"},
+				{Name: "Invisible", Value: "invisible"},
+			},
+		},
+	},
+}
+
 // purgeCommand is the application command definition registered with Discord.
 //
 // DefaultMemberPermissions restricts visibility/use to members with Manage
@@ -47,10 +113,12 @@ var purgeCommand = &discordgo.ApplicationCommand{
 // called after the session is open so that the application ID is known.
 func (b *Bot) registerCommands(s *discordgo.Session) error {
 	appID := s.State.User.ID
-	if _, err := s.ApplicationCommandCreate(appID, "", purgeCommand); err != nil {
-		return fmt.Errorf("register %q command: %w", purgeCommand.Name, err)
+	for _, cmd := range []*discordgo.ApplicationCommand{purgeCommand, statusCommand} {
+		if _, err := s.ApplicationCommandCreate(appID, "", cmd); err != nil {
+			return fmt.Errorf("register %q command: %w", cmd.Name, err)
+		}
+		slog.Info("slash command registered", "command", cmd.Name)
 	}
-	slog.Info("slash command registered", "command", purgeCommand.Name)
 	return nil
 }
 
@@ -58,8 +126,11 @@ func (b *Bot) onInteractionCreate(s *discordgo.Session, i *discordgo.Interaction
 	if i.Type != discordgo.InteractionApplicationCommand {
 		return
 	}
-	if i.ApplicationCommandData().Name == purgeCommandName {
+	switch i.ApplicationCommandData().Name {
+	case purgeCommandName:
 		b.handlePurge(s, i)
+	case statusCommandName:
+		b.handleStatus(s, i)
 	}
 }
 
@@ -90,6 +161,43 @@ func (b *Bot) handlePurge(s *discordgo.Session, i *discordgo.InteractionCreate) 
 		"channel_id", i.ChannelID, "user_id", interactionUserID(i),
 		"requested", count, "deleted", deleted)
 	b.editInteraction(s, i, fmt.Sprintf("Deleted %d message(s).", deleted))
+}
+
+func (b *Bot) handleStatus(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	opts := optionMap(i.ApplicationCommandData().Options)
+
+	typeChoice := opts["type"].StringValue()
+	text := opts["text"].StringValue()
+	presenceChoice := "online"
+	if opt, ok := opts["presence"]; ok {
+		presenceChoice = opt.StringValue()
+	}
+
+	activityType := statusActivityTypes[typeChoice]
+	activity := &discordgo.Activity{
+		Name: text,
+		Type: activityType,
+	}
+	// A custom status carries its text in State; Discord still requires a
+	// non-empty Name, so a placeholder is used (matching discordgo's own
+	// UpdateCustomStatus helper).
+	if activityType == discordgo.ActivityTypeCustom {
+		activity.Name = "Custom Status"
+		activity.State = text
+	}
+
+	if err := s.UpdateStatusComplex(discordgo.UpdateStatusData{
+		Status:     statusPresences[presenceChoice],
+		Activities: []*discordgo.Activity{activity},
+	}); err != nil {
+		slog.Error("status update failed", "user_id", interactionUserID(i), "error", err)
+		b.respondEphemeral(s, i, fmt.Sprintf("Failed to update status: %v", err))
+		return
+	}
+
+	slog.Info("status updated",
+		"user_id", interactionUserID(i), "type", typeChoice, "text", text, "presence", presenceChoice)
+	b.respondEphemeral(s, i, "Status updated.")
 }
 
 // purgeMessages deletes up to count most-recent messages from the channel and
@@ -141,6 +249,29 @@ func (b *Bot) editInteraction(s *discordgo.Session, i *discordgo.InteractionCrea
 	}); err != nil {
 		slog.Error("purge: edit response failed", "channel_id", i.ChannelID, "error", err)
 	}
+}
+
+// respondEphemeral sends an immediate, private reply to an interaction.
+func (b *Bot) respondEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
+	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: content,
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	}); err != nil {
+		slog.Error("respond failed", "user_id", interactionUserID(i), "error", err)
+	}
+}
+
+// optionMap indexes interaction options by name so handlers can read them
+// without relying on positional order (which matters when some are optional).
+func optionMap(opts []*discordgo.ApplicationCommandInteractionDataOption) map[string]*discordgo.ApplicationCommandInteractionDataOption {
+	m := make(map[string]*discordgo.ApplicationCommandInteractionDataOption, len(opts))
+	for _, opt := range opts {
+		m[opt.Name] = opt
+	}
+	return m
 }
 
 // interactionUserID returns the invoking user's ID, whether the interaction
