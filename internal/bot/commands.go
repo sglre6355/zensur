@@ -55,9 +55,15 @@ var statusCommand = &discordgo.ApplicationCommand{
 	Options: []*discordgo.ApplicationCommandOption{
 		{
 			Type:        discordgo.ApplicationCommandOptionString,
+			Name:        "text",
+			Description: "The status text (leave empty to clear the presence)",
+			Required:    false,
+		},
+		{
+			Type:        discordgo.ApplicationCommandOptionString,
 			Name:        "type",
-			Description: "Activity type",
-			Required:    true,
+			Description: "Activity type (defaults to Playing)",
+			Required:    false,
 			Choices: []*discordgo.ApplicationCommandOptionChoice{
 				{Name: "Playing", Value: "playing"},
 				{Name: "Watching", Value: "watching"},
@@ -65,12 +71,6 @@ var statusCommand = &discordgo.ApplicationCommand{
 				{Name: "Competing", Value: "competing"},
 				{Name: "Custom", Value: "custom"},
 			},
-		},
-		{
-			Type:        discordgo.ApplicationCommandOptionString,
-			Name:        "text",
-			Description: "The status text",
-			Required:    true,
 		},
 		{
 			Type:        discordgo.ApplicationCommandOptionString,
@@ -166,29 +166,41 @@ func (b *Bot) handlePurge(s *discordgo.Session, i *discordgo.InteractionCreate) 
 func (b *Bot) handleStatus(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	opts := optionMap(i.ApplicationCommandData().Options)
 
-	typeChoice := opts["type"].StringValue()
-	text := opts["text"].StringValue()
+	typeChoice := "playing"
+	if opt, ok := opts["type"]; ok {
+		typeChoice = opt.StringValue()
+	}
+	text := ""
+	if opt, ok := opts["text"]; ok {
+		text = opt.StringValue()
+	}
 	presenceChoice := "online"
 	if opt, ok := opts["presence"]; ok {
 		presenceChoice = opt.StringValue()
 	}
 
-	activityType := statusActivityTypes[typeChoice]
-	activity := &discordgo.Activity{
-		Name: text,
-		Type: activityType,
-	}
-	// A custom status carries its text in State; Discord still requires a
-	// non-empty Name, so a placeholder is used (matching discordgo's own
-	// UpdateCustomStatus helper).
-	if activityType == discordgo.ActivityTypeCustom {
-		activity.Name = "Custom Status"
-		activity.State = text
+	// An empty text clears the activity line; Discord shows the bot with only
+	// its online status and no "Playing ..." text.
+	var activities []*discordgo.Activity
+	if text != "" {
+		activityType := statusActivityTypes[typeChoice]
+		activity := &discordgo.Activity{
+			Name: text,
+			Type: activityType,
+		}
+		// A custom status carries its text in State; Discord still requires a
+		// non-empty Name, so a placeholder is used (matching discordgo's own
+		// UpdateCustomStatus helper).
+		if activityType == discordgo.ActivityTypeCustom {
+			activity.Name = "Custom Status"
+			activity.State = text
+		}
+		activities = []*discordgo.Activity{activity}
 	}
 
 	if err := s.UpdateStatusComplex(discordgo.UpdateStatusData{
 		Status:     statusPresences[presenceChoice],
-		Activities: []*discordgo.Activity{activity},
+		Activities: activities,
 	}); err != nil {
 		slog.Error("status update failed", "user_id", interactionUserID(i), "error", err)
 		b.respondEphemeral(s, i, fmt.Sprintf("Failed to update status: %v", err))
@@ -197,7 +209,11 @@ func (b *Bot) handleStatus(s *discordgo.Session, i *discordgo.InteractionCreate)
 
 	slog.Info("status updated",
 		"user_id", interactionUserID(i), "type", typeChoice, "text", text, "presence", presenceChoice)
-	b.respondEphemeral(s, i, "Status updated.")
+	if text == "" {
+		b.respondEphemeral(s, i, "Status cleared.")
+	} else {
+		b.respondEphemeral(s, i, "Status updated.")
+	}
 }
 
 // purgeMessages deletes up to count most-recent messages from the channel and
