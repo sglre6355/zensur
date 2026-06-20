@@ -1,6 +1,86 @@
 package censor
 
-import "testing"
+import (
+	"sort"
+	"testing"
+)
+
+func TestParseConversationVerdict(t *testing.T) {
+	known := map[string]struct{}{"1": {}, "2": {}, "3": {}}
+
+	t.Run("keeps known ids", func(t *testing.T) {
+		out, err := parseConversationVerdict(
+			`{"flagged":[{"id":"1","reason":"frag wa"},{"id":"2","reason":"frag ho"}]}`, known)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got := ids(out)
+		if len(got) != 2 || got[0] != "1" || got[1] != "2" {
+			t.Fatalf("ids = %v, want [1 2]", got)
+		}
+		if out[0].Reason != "frag wa" {
+			t.Errorf("reason = %q", out[0].Reason)
+		}
+	})
+
+	t.Run("drops hallucinated ids", func(t *testing.T) {
+		out, err := parseConversationVerdict(
+			`{"flagged":[{"id":"2","reason":"x"},{"id":"999","reason":"made up"}]}`, known)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := ids(out); len(got) != 1 || got[0] != "2" {
+			t.Fatalf("ids = %v, want [2]", got)
+		}
+	})
+
+	t.Run("deduplicates", func(t *testing.T) {
+		out, err := parseConversationVerdict(
+			`{"flagged":[{"id":"3"},{"id":"3"}]}`, known)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := ids(out); len(got) != 1 || got[0] != "3" {
+			t.Fatalf("ids = %v, want [3]", got)
+		}
+	})
+
+	t.Run("empty flagged", func(t *testing.T) {
+		out, err := parseConversationVerdict(`{"flagged":[]}`, known)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(out) != 0 {
+			t.Fatalf("want none, got %v", ids(out))
+		}
+	})
+
+	t.Run("tolerates code fence", func(t *testing.T) {
+		out, err := parseConversationVerdict(
+			"```json\n{\"flagged\":[{\"id\":\"1\",\"reason\":\"r\"}]}\n```", known)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := ids(out); len(got) != 1 || got[0] != "1" {
+			t.Fatalf("ids = %v, want [1]", got)
+		}
+	})
+
+	t.Run("no json errors", func(t *testing.T) {
+		if _, err := parseConversationVerdict("I can't help.", known); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
+func ids(fms []FlaggedMessage) []string {
+	out := make([]string, len(fms))
+	for i, fm := range fms {
+		out[i] = fm.ID
+	}
+	sort.Strings(out)
+	return out
+}
 
 func TestParseVerdict(t *testing.T) {
 	cases := []struct {

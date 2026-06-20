@@ -62,10 +62,11 @@ rules:
     action: delete
     allow: ["scunthorpe"]   # exempts the message when "scunthorpe" is present
 
-# Optional semantic filter. Each message is also judged by a large language
-# model against the natural-language `directive` below. A message is acted on
-# if EITHER the pattern rules above OR the model flag it; when both fire, the
-# more disruptive action wins (log < warn < delete).
+# Optional semantic filter. The text filter judges the last `context_messages`
+# messages together against the natural-language `directive` below, so it also
+# catches a banned term split across consecutive messages (e.g. "wa" then "ho").
+# The model returns which messages to delete; the configured `action` is applied
+# to each. Pattern rules above still run per-message and independently.
 #
 # Each provider is its official Go SDK wrapped behind one small in-house adapter,
 # so switching vendors is just a provider/model change here — no code changes.
@@ -83,10 +84,11 @@ llm:
   notice: "Your message was removed by the moderation assistant."
 
   # Tuning (all optional):
+  # context_messages: 10         # recent messages scanned together for split-up terms (1 = per-message)
   # timeout_seconds: 15          # per-call timeout
   # max_tokens: 1024             # reply cap; high because reasoning models count hidden tokens here
   # temperature: 0               # omit to use the model default; reasoning models (GPT-5) reject custom values
-  # max_message_chars: 4000      # truncate long messages before sending, to bound token use
+  # max_message_chars: 4000      # truncate each message before sending, to bound token use
 
   # The moderation policy, in plain language. Be specific about what to flag
   # and what to leave alone — the model applies only what you write here.

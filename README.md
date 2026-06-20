@@ -39,10 +39,18 @@ Plus a per-rule `allow` list of phrases that suppress the rule when present (the
 ## Semantic (LLM) filter
 
 Pattern rules catch known strings; an optional **LLM filter** catches things you can only describe
-in words ("flag targeted harassment", "flag scam links"). When enabled, every message is also judged
-by a large language model against a natural-language `directive`. A message is acted on if
-**either** the pattern rules **or** the model flag it; when both fire, the more disruptive action
-wins (`log` < `warn` < `delete`).
+in words ("flag targeted harassment", "flag scam links"). When enabled, each new message triggers a
+scan of the **last `context_messages` messages** (default 10) judged together against a
+natural-language `directive`. Looking at a window rather than one message at a time lets the model
+catch a banned term **split across consecutive messages** (e.g. `wa` then `ho`). The model returns
+the ids of every offending message, and the configured `action` (`log` / `warn` / `delete`) is
+applied to each. Pattern rules still run per-message and independently — a message is acted on if
+either the rules or the model flag it.
+
+Because every message kicks off its own (concurrent) scan, two passes can flag the same message at
+once. Deletes are **idempotent**: an already-deleted message (HTTP 404 / Discord "Unknown Message")
+is treated as success, so the races resolve harmlessly. Ids the model invents that weren't in the
+window are discarded.
 
 Each provider is its official Go SDK wrapped behind a small in-house adapter (the `chatProvider`
 interface), so switching vendors is just a `provider`/`model` change in the config. Supported
@@ -67,8 +75,11 @@ llm:
 ```
 
 The API key is read from the environment variable named by `api_key_env`, so secrets stay out of the
-config file. See [`config.example.yaml`](config.example.yaml) for every option (`endpoint`,
-`timeout_seconds`, `max_tokens`, `temperature`, `max_message_chars`, `notice`).
+config file. See [`config.example.yaml`](config.example.yaml) for every option (`context_messages`,
+`endpoint`, `timeout_seconds`, `max_tokens`, `temperature`, `max_message_chars`, `notice`). The
+windowed scan needs the **Read Message History** permission. Note each message sends the whole
+window to the model, so token cost scales with `context_messages`; set it to `1` for cheaper
+per-message evaluation if split-term evasion isn't a concern.
 
 ### Image attachments
 

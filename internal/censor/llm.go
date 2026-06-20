@@ -18,6 +18,7 @@ const (
 	// against this budget; too low a cap starves the visible JSON verdict.
 	defaultLLMMaxTokens = 1024
 	defaultLLMMaxChars  = 4000
+	defaultLLMWindow    = 10
 
 	defaultImageMaxBytes int64 = 5 << 20 // 5 MiB
 	defaultImageMaxCount       = 4
@@ -37,20 +38,55 @@ Respond with a single line of compact JSON and nothing else, in exactly this for
 {"flagged": true, "reason": "<short reason, at most 100 characters>"}
 Use {"flagged": false, "reason": ""} when nothing violates the policy.`
 
-const textUserTemplate = `Decide whether this MESSAGE violates the policy:
---- MESSAGE ---
-%s
---- END MESSAGE ---`
-
 const imageUserTemplate = `Decide whether the attached IMAGE (and any caption below) violates the policy.
 --- CAPTION ---
 %s
 --- END CAPTION ---`
 
-// Verdict is the model's judgement about a single message or image.
+// conversationIntro frames the windowed text classifier: it sees several recent
+// messages at once so it can catch a banned term split across consecutive
+// messages, and returns the ids of every offending message.
+const conversationIntro = `You are a strict content-moderation classifier for a chat platform.
+
+Apply the following moderation policy exactly. Do not invent additional rules,
+and do not flag content the policy does not cover.
+--- POLICY ---
+%s
+--- END POLICY ---
+
+You are given the most recent messages in one channel, oldest first, each tagged
+with its message id and author. Offenders often try to bypass the policy by
+splitting a banned word or phrase across several consecutive messages (for
+example sending "wa" then "ho" to spell a banned word). Read the messages
+together, in order, treating each author's consecutive messages as a continuous
+stream.
+
+Respond with a single JSON object and nothing else, in exactly this form:
+{"flagged": [{"id": "<message id>", "reason": "<short reason, at most 100 characters>"}]}
+List every message that violates the policy, INCLUDING each message that
+contributes a fragment of a split-up banned term. Use {"flagged": []} when no
+message violates the policy.`
+
+const conversationUserTemplate = `Messages to evaluate:
+%s`
+
+// Verdict is the model's judgement about a single image.
 type Verdict struct {
 	Flagged bool
 	Reason  string
+}
+
+// ConversationMessage is one message handed to the windowed text filter.
+type ConversationMessage struct {
+	ID      string
+	Author  string
+	Content string
+}
+
+// FlaggedMessage identifies a message the model judged to violate the policy.
+type FlaggedMessage struct {
+	ID     string
+	Reason string
 }
 
 // LLMFilter evaluates messages and image attachments against natural-language
@@ -65,6 +101,7 @@ type LLMFilter struct {
 	action    Action
 	notice    string
 	maxChars  int
+	window    int // number of recent messages evaluated together
 
 	// Image filtering.
 	imagesEnabled  bool
@@ -117,6 +154,10 @@ func NewLLMFilter(cfg *LLMConfig) (*LLMFilter, error) {
 	if cfg.MaxMessageChars > 0 {
 		maxChars = cfg.MaxMessageChars
 	}
+	window := defaultLLMWindow
+	if cfg.ContextMessages > 0 {
+		window = cfg.ContextMessages
+	}
 
 	var apiKey string
 	if env := strings.TrimSpace(cfg.APIKeyEnv); env != "" {
@@ -138,6 +179,7 @@ func NewLLMFilter(cfg *LLMConfig) (*LLMFilter, error) {
 		action:      action,
 		notice:      cfg.Notice,
 		maxChars:    maxChars,
+		window:      window,
 		timeout:     timeout,
 		maxTokens:   maxTokens,
 		temperature: cfg.Temperature,
@@ -216,29 +258,54 @@ func (f *LLMFilter) ImageMaxBytes() int64 { return f.imageMaxBytes }
 // ImageMaxCount is the maximum number of image attachments checked per message.
 func (f *LLMFilter) ImageMaxCount() int { return f.imageMaxCount }
 
-// Evaluate asks the model whether content violates the text directive. The
-// supplied context bounds the call; Evaluate additionally applies its own
-// timeout so a background context still cannot hang.
-func (f *LLMFilter) Evaluate(ctx context.Context, content string) (Verdict, error) {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return Verdict{}, nil
+// Window is the number of recent messages evaluated together by EvaluateConversation.
+func (f *LLMFilter) Window() int { return f.window }
+
+// EvaluateConversation asks the model which of the given messages violate the
+// text directive, considering them together so a banned term split across
+// several messages is caught. msgs should be ordered oldest-first. It returns
+// the offending messages (by id, with a reason); ids the model invents that are
+// not in msgs are discarded. The supplied context bounds the call; an
+// additional internal timeout guards against a hung request.
+func (f *LLMFilter) EvaluateConversation(ctx context.Context, msgs []ConversationMessage) ([]FlaggedMessage, error) {
+	if len(msgs) == 0 {
+		return nil, nil
 	}
-	if f.maxChars > 0 {
-		if runes := []rune(content); len(runes) > f.maxChars {
-			content = string(runes[:f.maxChars])
+
+	var sb strings.Builder
+	known := make(map[string]struct{}, len(msgs))
+	for _, m := range msgs {
+		if strings.TrimSpace(m.ID) == "" {
+			continue
 		}
+		content := m.Content
+		if f.maxChars > 0 {
+			if runes := []rune(content); len(runes) > f.maxChars {
+				content = string(runes[:f.maxChars])
+			}
+		}
+		// Keep each message on one line so ids stay unambiguous.
+		content = strings.ReplaceAll(content, "\n", " ")
+		author := strings.TrimSpace(m.Author)
+		if author == "" {
+			author = "unknown"
+		}
+		fmt.Fprintf(&sb, "[id=%s author=%s] %s\n", m.ID, author, content)
+		known[m.ID] = struct{}{}
+	}
+	if len(known) == 0 {
+		return nil, nil
 	}
 
 	reply, err := f.run(ctx, chatRequest{
 		model:  f.textModel,
-		system: fmt.Sprintf(classifierIntro, f.directive),
-		text:   fmt.Sprintf(textUserTemplate, content),
+		system: fmt.Sprintf(conversationIntro, f.directive),
+		text:   fmt.Sprintf(conversationUserTemplate, sb.String()),
 	})
 	if err != nil {
-		return Verdict{}, err
+		return nil, err
 	}
-	return parseVerdict(reply)
+	return parseConversationVerdict(reply, known)
 }
 
 // EvaluateImage asks the model whether an image attachment (with an optional
@@ -302,6 +369,45 @@ func parseVerdict(s string) (Verdict, error) {
 		return Verdict{}, fmt.Errorf("parse verdict json: %w", err)
 	}
 	return Verdict{Flagged: raw.Flagged, Reason: strings.TrimSpace(raw.Reason)}, nil
+}
+
+// parseConversationVerdict extracts the {"flagged":[{id,reason}]} object from a
+// model response. It keeps only ids present in known (guarding against
+// hallucinated ids) and deduplicates, so the caller can trust every returned id
+// corresponds to a real message it supplied.
+func parseConversationVerdict(s string, known map[string]struct{}) ([]FlaggedMessage, error) {
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start < 0 || end <= start {
+		return nil, fmt.Errorf("no JSON verdict in model response: %q", truncateForError(s))
+	}
+	var raw struct {
+		Flagged []struct {
+			ID     string `json:"id"`
+			Reason string `json:"reason"`
+		} `json:"flagged"`
+	}
+	if err := json.Unmarshal([]byte(s[start:end+1]), &raw); err != nil {
+		return nil, fmt.Errorf("parse verdict json: %w", err)
+	}
+
+	var out []FlaggedMessage
+	seen := make(map[string]struct{}, len(raw.Flagged))
+	for _, fm := range raw.Flagged {
+		id := strings.TrimSpace(fm.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := known[id]; !ok {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, FlaggedMessage{ID: id, Reason: strings.TrimSpace(fm.Reason)})
+	}
+	return out, nil
 }
 
 func truncateForError(s string) string {

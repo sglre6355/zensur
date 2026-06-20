@@ -49,6 +49,10 @@ type LLMConfig struct {
 	// Directive is the natural-language moderation policy the model applies to
 	// message text.
 	Directive string `yaml:"directive"`
+	// ContextMessages is how many recent messages (including the triggering one)
+	// are sent to the model together, so it can catch a banned term split across
+	// consecutive messages. Default 10; set to 1 for per-message evaluation.
+	ContextMessages int `yaml:"context_messages,omitempty"`
 	// Action is taken when the model flags a message: log, delete, or warn.
 	// (replace is unavailable because the model reports no character spans.)
 	Action string `yaml:"action"`

@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -135,6 +136,20 @@ func (b *Bot) process(s *discordgo.Session, msg *discordgo.Message) {
 	if msg == nil {
 		return
 	}
+	// Path A: pattern rules and the image filter act on this single message.
+	b.applyMessageRules(s, msg)
+
+	// Path B: the windowed semantic filter scans the last N messages together,
+	// so a banned term split across several messages (e.g. "wa" + "ho") is
+	// caught, and deletes every message it flags. Only triggered by new text.
+	if b.llm != nil && msg.Content != "" {
+		b.scanConversation(s, msg)
+	}
+}
+
+// applyMessageRules runs the pattern ruleset and per-image vision filter against
+// a single message and applies the most disruptive resulting action to it.
+func (b *Bot) applyMessageRules(s *discordgo.Session, msg *discordgo.Message) {
 	images := b.filterableImages(msg)
 	if msg.Content == "" && len(images) == 0 {
 		return
@@ -144,34 +159,15 @@ func (b *Bot) process(s *discordgo.Session, msg *discordgo.Message) {
 	if msg.Content != "" {
 		hits = b.ruleset.Match(msg.Content)
 	}
-
-	// Start from the most disruptive pattern-rule action (ActionLog when no
-	// rule matched) and escalate if the semantic filter also flags the message.
 	flagged := len(hits) > 0
 	action := censor.MaxAction(hits)
 
-	llmFlagged := false
-	var llmReason string
-	if b.llm != nil && msg.Content != "" {
-		verdict, err := b.llm.Evaluate(context.Background(), msg.Content)
-		switch {
-		case err != nil:
-			slog.Error("llm filter failed",
-				"channel_id", msg.ChannelID, "message_id", msg.ID, "error", err)
-		case verdict.Flagged:
-			flagged = true
-			llmFlagged = true
-			llmReason = verdict.Reason
-			action = censor.MoreSevere(action, b.llm.Action())
-		}
-	}
-
+	imageFlagged := false
+	var imageReason string
 	if reason, ok := b.evaluateImages(msg, images); ok {
 		flagged = true
-		llmFlagged = true
-		if llmReason == "" {
-			llmReason = reason
-		}
+		imageFlagged = true
+		imageReason = reason
 		action = censor.MoreSevere(action, b.llm.ImageAction())
 	}
 
@@ -182,8 +178,8 @@ func (b *Bot) process(s *discordgo.Session, msg *discordgo.Message) {
 	slog.Info("censor hit",
 		"action", action.String(),
 		"rules", uniqueRuleIDs(hits),
-		"llm", llmFlagged,
-		"llm_reason", llmReason,
+		"image", imageFlagged,
+		"image_reason", imageReason,
 		"user_id", msg.Author.ID,
 		"guild_id", msg.GuildID,
 		"channel_id", msg.ChannelID,
@@ -197,17 +193,85 @@ func (b *Bot) process(s *discordgo.Session, msg *discordgo.Message) {
 		b.deleteMessage(s, msg)
 	case censor.ActionWarn:
 		b.deleteMessage(s, msg)
-		b.sendNotice(s, msg, hits, llmFlagged)
+		b.sendNotice(s, msg, hits, imageFlagged)
 	case censor.ActionReplace:
-		// Replace only ever comes from a pattern rule (the LLM action is limited
-		// to log/delete/warn), so hits are guaranteed non-empty here.
+		// Replace only ever comes from a pattern rule (the image action is
+		// limited to log/delete/warn), so hits are guaranteed non-empty here.
 		censored := b.ruleset.Censor(msg.Content, hits)
 		b.deleteMessage(s, msg)
 		if err := b.repostViaWebhook(s, msg, censored); err != nil {
 			slog.Error("webhook repost failed; falling back to notice",
 				"channel_id", msg.ChannelID, "error", err)
-			b.sendNotice(s, msg, hits, llmFlagged)
+			b.sendNotice(s, msg, hits, imageFlagged)
 		}
+	}
+}
+
+// scanConversation sends the channel's most recent messages to the semantic
+// filter as one window and deletes every message it flags. Because each new
+// message triggers its own (concurrent) scan, two passes can flag the same
+// message; deletes are idempotent (a 404 from an already-removed message is
+// treated as success), so the races resolve harmlessly.
+func (b *Bot) scanConversation(s *discordgo.Session, msg *discordgo.Message) {
+	window := b.llm.Window()
+	if window < 1 {
+		window = 1
+	}
+	fetched, err := s.ChannelMessages(msg.ChannelID, window, "", "", "")
+	if err != nil {
+		slog.Error("conversation fetch failed",
+			"channel_id", msg.ChannelID, "message_id", msg.ID, "error", err)
+		return
+	}
+
+	// ChannelMessages returns newest-first; reverse to oldest-first and keep only
+	// human messages that carry text. Skipping the bot's own posts avoids
+	// flagging our notices and webhook reposts.
+	conv := make([]censor.ConversationMessage, 0, len(fetched))
+	for i := len(fetched) - 1; i >= 0; i-- {
+		m := fetched[i]
+		if m == nil || m.Author == nil || m.Author.Bot || m.Content == "" {
+			continue
+		}
+		conv = append(conv, censor.ConversationMessage{
+			ID:      m.ID,
+			Author:  messageAuthor(m),
+			Content: m.Content,
+		})
+	}
+	if len(conv) == 0 {
+		return
+	}
+
+	flagged, err := b.llm.EvaluateConversation(context.Background(), conv)
+	if err != nil {
+		slog.Error("llm conversation filter failed",
+			"channel_id", msg.ChannelID, "message_id", msg.ID, "error", err)
+		return
+	}
+	if len(flagged) == 0 {
+		return
+	}
+
+	action := b.llm.Action()
+	deleted := 0
+	for _, fm := range flagged {
+		slog.Info("censor hit (conversation)",
+			"action", action.String(),
+			"llm_reason", fm.Reason,
+			"guild_id", msg.GuildID,
+			"channel_id", msg.ChannelID,
+			"message_id", fm.ID,
+		)
+		if action == censor.ActionLog {
+			continue
+		}
+		if b.deleteByID(s, msg.ChannelID, fm.ID) {
+			deleted++
+		}
+	}
+	if action == censor.ActionWarn && deleted > 0 {
+		b.sendNoticeText(s, msg.ChannelID, b.noticeText(nil, true))
 	}
 }
 
@@ -335,21 +399,67 @@ func isImageAttachment(att *discordgo.MessageAttachment) bool {
 }
 
 func (b *Bot) deleteMessage(s *discordgo.Session, msg *discordgo.Message) {
-	if err := s.ChannelMessageDelete(msg.ChannelID, msg.ID); err != nil {
-		slog.Error("delete message failed",
-			"channel_id", msg.ChannelID, "message_id", msg.ID, "error", err)
+	b.deleteByID(s, msg.ChannelID, msg.ID)
+}
+
+// deleteByID deletes a message, treating an already-deleted message (HTTP 404 /
+// Discord "Unknown Message") as success rather than an error. Concurrent filter
+// passes can race to delete the same message — one wins, the rest 404 — so this
+// keeps the noise out of the logs. Returns true if this call did the deletion.
+func (b *Bot) deleteByID(s *discordgo.Session, channelID, messageID string) bool {
+	err := s.ChannelMessageDelete(channelID, messageID)
+	if err == nil {
+		return true
 	}
+	if isMissingMessage(err) {
+		slog.Debug("message already deleted",
+			"channel_id", channelID, "message_id", messageID)
+		return false
+	}
+	slog.Error("delete message failed",
+		"channel_id", channelID, "message_id", messageID, "error", err)
+	return false
+}
+
+// isMissingMessage reports whether err is Discord's response for a message that
+// no longer exists (HTTP 404 or error code 10008, Unknown Message).
+func isMissingMessage(err error) bool {
+	var rest *discordgo.RESTError
+	if !errors.As(err, &rest) {
+		return false
+	}
+	if rest.Response != nil && rest.Response.StatusCode == http.StatusNotFound {
+		return true
+	}
+	return rest.Message != nil && rest.Message.Code == discordgo.ErrCodeUnknownMessage
+}
+
+// messageAuthor returns a human-readable display name for a message author.
+func messageAuthor(m *discordgo.Message) string {
+	if m.Member != nil && m.Member.Nick != "" {
+		return m.Member.Nick
+	}
+	if m.Author != nil {
+		if m.Author.GlobalName != "" {
+			return m.Author.GlobalName
+		}
+		return m.Author.Username
+	}
+	return "unknown"
 }
 
 func (b *Bot) sendNotice(s *discordgo.Session, msg *discordgo.Message, hits []censor.Hit, llmFlagged bool) {
-	notice := b.noticeText(hits, llmFlagged)
+	b.sendNoticeText(s, msg.ChannelID, b.noticeText(hits, llmFlagged))
+}
+
+// sendNoticeText posts a notice to a channel and schedules its auto-deletion.
+func (b *Bot) sendNoticeText(s *discordgo.Session, channelID, notice string) {
 	if notice == "" {
 		return
 	}
-	sent, err := s.ChannelMessageSend(msg.ChannelID, notice)
+	sent, err := s.ChannelMessageSend(channelID, notice)
 	if err != nil {
-		slog.Error("send notice failed",
-			"channel_id", msg.ChannelID, "error", err)
+		slog.Error("send notice failed", "channel_id", channelID, "error", err)
 		return
 	}
 	if b.ruleset.NoticeAutoDeleteSeconds > 0 {
